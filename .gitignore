@@ -1,0 +1,24 @@
+# Secrets and local state
+.env
+credentials.json
+bot_persistence.pickle
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Debug scratch
+_md_debug.txt
+*.bak3mb
