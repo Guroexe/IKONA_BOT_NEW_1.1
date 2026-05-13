@@ -185,6 +185,31 @@ def _google_credentials_from_env() -> dict | None:
     if not isinstance(info, dict):
         logger.warning("GOOGLE_CREDENTIALS_JSON must be a JSON object")
         return None
+    return _normalize_google_service_account_info(info)
+
+
+def _normalize_google_service_account_info(info: dict) -> dict:
+    """Исправляет private_key после вставки JSON в Railway Variables (литеральные \\n)."""
+    normalized = dict(info)
+    private_key = normalized.get("private_key")
+    if isinstance(private_key, str):
+        if "\\n" in private_key and "\n" not in private_key:
+            normalized["private_key"] = private_key.replace("\\n", "\n")
+        normalized["private_key"] = normalized["private_key"].strip()
+    return normalized
+
+
+def _load_google_service_account_info() -> dict:
+    cred_path = _google_credentials_path()
+    if os.path.isfile(cred_path):
+        with open(cred_path, encoding="utf-8") as f:
+            info = json.load(f)
+        if isinstance(info, dict):
+            return _normalize_google_service_account_info(info)
+        raise ValueError(f"Google credentials file is not a JSON object: {cred_path}")
+    info = _google_credentials_from_env()
+    if info is None:
+        raise FileNotFoundError(cred_path)
     return info
 
 
@@ -194,6 +219,8 @@ def _materialize_google_credentials_from_env() -> None:
     if info is None:
         return
     cred_path = _google_credentials_path()
+    if os.path.isfile(cred_path):
+        return
     try:
         with open(cred_path, "w", encoding="utf-8") as f:
             json.dump(info, f)
@@ -456,14 +483,11 @@ BASE_RETRY_DELAY = 60
 def get_gspread_client():
     try:
         scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        cred_path = _google_credentials_path()
-        if os.path.isfile(cred_path):
-            creds = Credentials.from_service_account_file(cred_path, scopes=scopes)
-        else:
-            info = _google_credentials_from_env()
-            if info is None:
-                raise FileNotFoundError(cred_path)
-            creds = Credentials.from_service_account_info(info, scopes=scopes)
+        info = _load_google_service_account_info()
+        creds = Credentials.from_service_account_info(info, scopes=scopes)
+        from google.auth.transport.requests import Request
+
+        creds.refresh(Request())
         client = gspread.authorize(creds)
         logger.info("Successfully connected to Google Sheets.")
         return client
@@ -471,15 +495,33 @@ def get_gspread_client():
         logger.error("Google Sheets credentials file not found: %s", _google_credentials_path())
         return None
     except Exception as e:
-        logger.error(f"Failed to connect to Google Sheets: {e}")
+        logger.error("Failed to connect to Google Sheets: %s", e)
         return None
 
 _materialize_google_credentials_from_env()
 gspread_client = get_gspread_client()
-spreadsheet = gspread_client.open_by_key(GOOGLE_SHEET_ID) if gspread_client else None
+spreadsheet = None
 sheets_cache = {}
 
+
+def get_spreadsheet():
+    global spreadsheet
+    if spreadsheet is not None:
+        return spreadsheet
+    if not gspread_client or not GOOGLE_SHEET_ID:
+        return None
+    try:
+        spreadsheet = gspread_client.open_by_key(GOOGLE_SHEET_ID)
+        return spreadsheet
+    except Exception as e:
+        logger.error("Failed to open Google spreadsheet %s: %s", GOOGLE_SHEET_ID, e)
+        return None
+
 async def get_worksheet_cached(sheet_name: str):
+    sheet = get_spreadsheet()
+    if sheet is None:
+        logger.error("Spreadsheet client not available for worksheet %s", sheet_name)
+        return None
     now = time.time()
     if sheet_name in sheets_cache:
         worksheet, timestamp = sheets_cache[sheet_name]
@@ -487,7 +529,7 @@ async def get_worksheet_cached(sheet_name: str):
             return worksheet
     for attempt in range(MAX_RETRIES):
         try:
-            worksheet = await asyncio.to_thread(spreadsheet.worksheet, sheet_name)
+            worksheet = await asyncio.to_thread(sheet.worksheet, sheet_name)
             sheets_cache[sheet_name] = (worksheet, now)
             return worksheet
         except WorksheetNotFound:
@@ -6385,7 +6427,8 @@ async def handle_rent_receipt_upload(update: Update, context: ContextTypes.DEFAU
 
 async def create_monthly_sheets_job():
     logger.info("Running scheduled job: create_monthly_sheets_job")
-    if not spreadsheet:
+    sheet = get_spreadsheet()
+    if not sheet:
         logger.error("Spreadsheet client not available. Skipping job.")
         return
     try:
@@ -6394,10 +6437,10 @@ async def create_monthly_sheets_job():
             target_date = today if i == 0 else (today.replace(day=28) + datetime.timedelta(days=4)).replace(day=1)
             name = f"{RUSSIAN_MONTHS[target_date.month]} {target_date.year}"
             try:
-                await asyncio.to_thread(spreadsheet.worksheet, name)
+                await asyncio.to_thread(sheet.worksheet, name)
             except WorksheetNotFound:
                 logger.info(f"Creating sheet '{name}'...")
-                await asyncio.to_thread(spreadsheet.add_worksheet, title=name, rows=300, cols=10)
+                await asyncio.to_thread(sheet.add_worksheet, title=name, rows=300, cols=10)
         logger.info("Monthly sheets check complete.")
     except Exception as e:
         logger.error(f"Error in create_monthly_sheets_job: {e}")
