@@ -252,7 +252,7 @@ def _validate_required_config() -> None:
 
 
 # --- Cooldown ---
-COMMAND_COOLDOWN = 2
+COMMAND_COOLDOWN = 0.35
 
 # --- Russian Months for Google Sheets ---
 RUSSIAN_MONTHS = {
@@ -472,7 +472,7 @@ except Exception:  # pragma: no cover
 
 # --- Rent Booking Constants ---
 TIME_SLOTS = ["10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00", "19:00", "20:00", "21:00", "22:00"]
-CACHE_TIMEOUT = 60
+CACHE_TIMEOUT = 120
 MAX_RETRIES = 3
 BASE_RETRY_DELAY = 60
 
@@ -892,7 +892,7 @@ def _telegram_http_request(*, media_write_timeout: float = 90.0, read_timeout: f
     )
 
 
-async def _bot_send_with_retry(coro_factory, *, attempts: int = 3, base_delay: float = 0.8):
+async def _bot_send_with_retry(coro_factory, *, attempts: int = 3, base_delay: float = 0.35):
     last_err: BaseException | None = None
     for attempt in range(attempts):
         try:
@@ -940,8 +940,28 @@ async def _send_main_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+def _gif_file_id_cache_key(gif_name: str) -> str:
+    return f"gif_file_id:{gif_name}"
+
+
 async def safe_send_animation(context: ContextTypes.DEFAULT_TYPE, chat_id: int, gif_name: str, caption: str, reply_markup=None, parse_mode=None):
     gif_path = os.path.normpath(os.path.join(SCRIPT_DIR, GIFS_DIR, gif_name))
+    cache_key = _gif_file_id_cache_key(gif_name)
+    cached_file_id = context.application.bot_data.get(cache_key)
+    if cached_file_id:
+        try:
+            await _bot_send_with_retry(
+                lambda: context.bot.send_animation(
+                    chat_id,
+                    animation=cached_file_id,
+                    caption=caption,
+                    reply_markup=reply_markup,
+                    parse_mode=parse_mode,
+                )
+            )
+            return
+        except BadRequest:
+            context.application.bot_data.pop(cache_key, None)
     if not os.path.isfile(gif_path):
         logger.warning(f"GIF файл не найден: {gif_path}")
         await _bot_send_with_retry(
@@ -966,7 +986,9 @@ async def safe_send_animation(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
             )
 
     try:
-        await _bot_send_with_retry(_send_animation_once)
+        sent = await _bot_send_with_retry(_send_animation_once)
+        if sent and getattr(sent, "animation", None) and sent.animation.file_id:
+            context.application.bot_data[cache_key] = sent.animation.file_id
     except Exception as e:
         logger.warning(f"Не удалось отправить GIF {gif_name}: {e}. Дубль текстом.")
         await _bot_send_with_retry(
@@ -1088,7 +1110,6 @@ def is_on_cooldown(context: ContextTypes.DEFAULT_TYPE, command_key: str) -> bool
     now = time.time()
     last_call = context.user_data.get(f'last_call_{command_key}', 0)
     if now - last_call < COMMAND_COOLDOWN:
-        logger.info(f"Cooldown active for user {context._user_id} on command '{command_key}'.")
         return True
     context.user_data[f'last_call_{command_key}'] = now
     return False
@@ -1130,8 +1151,8 @@ def generate_calendar_keyboard(year: int, month: int):
     keyboard.append([InlineKeyboardButton("« Отмена / в меню »", callback_data="back_to_menu")])
     return InlineKeyboardMarkup(keyboard)
 
-SLOTS_FETCH_TIMEOUT_SEC = 7.5
-CALENDAR_SHEET_FETCH_TIMEOUT_SEC = 10.0
+SLOTS_FETCH_TIMEOUT_SEC = 5.0
+CALENDAR_SHEET_FETCH_TIMEOUT_SEC = 7.0
 
 
 async def get_available_slots_count(worksheet, date_header: str) -> int:
@@ -1609,17 +1630,19 @@ async def handle_open_generate_submenu(update: Update, context: ContextTypes.DEF
 
 async def send_merch_window_photos(update: Update, context: ContextTypes.DEFAULT_TYPE, catalog: list, indices: list[int]):
     """Три карточки по индексам каталога (индексы могут повторяться при len<3)."""
-    for slot, cat_i in enumerate(indices):
+    async def _send_one(slot: int, cat_i: int):
         item = catalog[cat_i]
         path = _resolve_merch_photo(item["photo"])
         if not os.path.isfile(path):
             await update.message.reply_text(f"⚠️ Нет файла фото для: {item.get('name', 'товар')}")
-            continue
+            return
         price = item.get("price") or 0
         price_line = f"{price} ₽" if price else "цена у администратора"
         cap = f"{item.get('name', 'Товар')} (позиция {slot + 1} из 3)\n{item.get('caption', '')}\n\n💰 {price_line}"
         with open(path, "rb") as photo:
             await update.message.reply_photo(photo, caption=cap[:1024])
+
+    await asyncio.gather(*(_send_one(slot, cat_i) for slot, cat_i in enumerate(indices)))
 
 
 def _merch_reply_markup(context: ContextTypes.DEFAULT_TYPE, catalog: list):
@@ -2919,6 +2942,9 @@ CASINO_WIN_FEED_MAX_ENTRIES = 120
 CASINO_WIN_FEED_LOBBY_LINES = 7
 CASINO_WIN_FEED_FULL_LINES = 28
 _casino_win_feed_lock = threading.Lock()
+_casino_win_feed_cache: list | None = None
+_casino_win_feed_cache_ts = 0.0
+CASINO_WIN_FEED_CACHE_SEC = 8.0
 
 CASINO_SPIN_LINES = (
     "🎰 · · ·\n_колёсико нервно дышит…_",
@@ -2955,13 +2981,20 @@ def _casino_win_feed_anon_label(user) -> str:
 
 
 def _casino_win_feed_load_sync() -> list:
+    global _casino_win_feed_cache, _casino_win_feed_cache_ts
+    now = time.time()
+    if _casino_win_feed_cache is not None and now - _casino_win_feed_cache_ts < CASINO_WIN_FEED_CACHE_SEC:
+        return _casino_win_feed_cache
     with _casino_win_feed_lock:
         try:
             with open(CASINO_WIN_FEED_FILE, encoding="utf-8") as f:
                 data = json.load(f)
-            return data if isinstance(data, list) else []
+            rows = data if isinstance(data, list) else []
         except Exception:
-            return []
+            rows = []
+        _casino_win_feed_cache = rows
+        _casino_win_feed_cache_ts = now
+        return rows
 
 
 def _casino_win_feed_append_sync(kind: str, anon: str) -> None:
@@ -2977,6 +3010,9 @@ def _casino_win_feed_append_sync(kind: str, anon: str) -> None:
         data = data[-CASINO_WIN_FEED_MAX_ENTRIES:]
         with open(CASINO_WIN_FEED_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
+        global _casino_win_feed_cache, _casino_win_feed_cache_ts
+        _casino_win_feed_cache = data
+        _casino_win_feed_cache_ts = time.time()
 
 
 async def _casino_win_feed_record(kind: str, user) -> None:
@@ -3182,18 +3218,18 @@ def _casino_train_win_probability(kind: str, user_id: int) -> float:
 
 
 async def _casino_run_spin_animation_on_message(msg, final_teaser: str | None = None) -> None:
-    for line in CASINO_SPIN_LINES:
+    for line in CASINO_SPIN_LINES[:2]:
         try:
             await msg.edit_text(line, parse_mode=ParseMode.MARKDOWN, reply_markup=None)
         except BadRequest:
             pass
-        await asyncio.sleep(0.38)
+        await asyncio.sleep(0.22)
     if final_teaser:
         try:
             await msg.edit_text(final_teaser, parse_mode=ParseMode.MARKDOWN, reply_markup=None)
         except BadRequest:
             pass
-        await asyncio.sleep(0.32)
+        await asyncio.sleep(0.18)
 
 
 async def finalize_free_rent_bonus_booking(query, context: ContextTypes.DEFAULT_TYPE):
@@ -4148,7 +4184,7 @@ async def _fair_cancel_round(query, context: ContextTypes.DEFAULT_TYPE, rs: dict
     )
 
 
-async def _fair_spin_animation(context: ContextTypes.DEFAULT_TYPE, rs: dict, frames: int = 2) -> None:
+async def _fair_spin_animation(context: ContextTypes.DEFAULT_TYPE, rs: dict, frames: int = 1) -> None:
     M = int(rs.get("M") or 0)
     if rs.get("ctrl_chat_id") and rs.get("ctrl_msg_id"):
         for i in range(frames):
@@ -4163,7 +4199,8 @@ async def _fair_spin_animation(context: ContextTypes.DEFAULT_TYPE, rs: dict, fra
                 reply_markup=None,
                 use_markdown=False,
             )
-            await asyncio.sleep(0.35)
+            if i + 1 < frames:
+                await asyncio.sleep(0.22)
 
 
 async def _fair_resolve_rent(query, context: ContextTypes.DEFAULT_TYPE, rs: dict, user):
@@ -5660,6 +5697,13 @@ async def handle_calendar_callback(update: Update, context: ContextTypes.DEFAULT
             return
 
         await _safe_callback_answer(query)
+        try:
+            await query.edit_message_text(
+                f"{_calendar_title(context)}\n\n⏳ Проверяю свободные места…",
+                reply_markup=keyboard,
+            )
+        except BadRequest:
+            pass
 
         sheet_name = f"{RUSSIAN_MONTHS[month]} {year}"
         try:
@@ -6455,10 +6499,22 @@ async def background_scheduler():
         await asyncio.sleep(wait_seconds)
         await create_monthly_sheets_job()
 
+async def _warm_google_sheets_cache() -> None:
+    try:
+        sheet = await asyncio.to_thread(get_spreadsheet)
+        if not sheet:
+            return
+        today = datetime.date.today()
+        await get_worksheet_cached(f"{RUSSIAN_MONTHS[today.month]} {today.year}")
+    except Exception as e:
+        logger.warning("sheet warm cache skipped: %s", e)
+
+
 async def post_init(application: Application) -> None:
     """Runs after the application has been initialized."""
     application.bot_data['http_client'] = httpx.AsyncClient()
     asyncio.create_task(background_scheduler())
+    asyncio.create_task(_warm_google_sheets_cache())
 
 async def on_shutdown(application: Application) -> None:
     """Runs before the application shuts down."""
@@ -6516,9 +6572,9 @@ def main() -> None:
             os.makedirs(directory)
             logger.info(f"Created directory: {directory}")
 
-    persistence = PicklePersistence(filepath=PERSISTENCE_FILE)
-    tg_request = _telegram_http_request()
-    updates_request = _telegram_http_request(read_timeout=35.0, media_write_timeout=90.0)
+    persistence = PicklePersistence(filepath=PERSISTENCE_FILE, update_interval=5.0)
+    tg_request = _telegram_http_request(read_timeout=12.0, media_write_timeout=60.0)
+    updates_request = _telegram_http_request(read_timeout=25.0, media_write_timeout=60.0)
 
     application = (
         Application.builder()
