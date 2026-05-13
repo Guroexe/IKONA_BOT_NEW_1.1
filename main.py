@@ -169,20 +169,34 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PERSISTENCE_FILE = os.path.join(SCRIPT_DIR, "bot_persistence.pickle")
 
 
-def _materialize_google_credentials_from_env() -> None:
-    """Railway: положите JSON сервисного аккаунта в переменную GOOGLE_CREDENTIALS_JSON — файл создастся при старте."""
+def _google_credentials_path() -> str:
+    return os.path.join(SCRIPT_DIR, os.path.basename(GOOGLE_SHEETS_CREDS_FILE))
+
+
+def _google_credentials_from_env() -> dict | None:
     raw = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
     if not raw:
-        return
-    cred_path = os.path.join(SCRIPT_DIR, os.path.basename(GOOGLE_SHEETS_CREDS_FILE))
+        return None
     try:
-        json.loads(raw)
+        info = json.loads(raw)
     except json.JSONDecodeError:
-        logger.warning("GOOGLE_CREDENTIALS_JSON is not valid JSON, skip writing credentials file")
+        logger.warning("GOOGLE_CREDENTIALS_JSON is not valid JSON")
+        return None
+    if not isinstance(info, dict):
+        logger.warning("GOOGLE_CREDENTIALS_JSON must be a JSON object")
+        return None
+    return info
+
+
+def _materialize_google_credentials_from_env() -> None:
+    """Railway: JSON сервисного аккаунта в GOOGLE_CREDENTIALS_JSON — при старте пишется в credentials.json."""
+    info = _google_credentials_from_env()
+    if info is None:
         return
+    cred_path = _google_credentials_path()
     try:
         with open(cred_path, "w", encoding="utf-8") as f:
-            f.write(raw)
+            json.dump(info, f)
         logger.info("Wrote Google service account credentials to %s", cred_path)
     except OSError as e:
         logger.error("Failed to write Google credentials: %s", e)
@@ -196,8 +210,8 @@ def _validate_required_config() -> None:
         missing.append("GOOGLE_SHEET_ID")
     if ADMIN_CHAT_ID == 0:
         missing.append("ADMIN_CHAT_ID")
-    cred_path = os.path.join(SCRIPT_DIR, os.path.basename(GOOGLE_SHEETS_CREDS_FILE))
-    if not os.path.isfile(cred_path):
+    cred_path = _google_credentials_path()
+    if not os.path.isfile(cred_path) and _google_credentials_from_env() is None:
         missing.append(
             f"Google credentials file ({cred_path}) — положите credentials.json рядом с main.py "
             "или задайте GOOGLE_CREDENTIALS_JSON"
@@ -442,17 +456,25 @@ BASE_RETRY_DELAY = 60
 def get_gspread_client():
     try:
         scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_file(GOOGLE_SHEETS_CREDS_FILE, scopes=scopes)
+        cred_path = _google_credentials_path()
+        if os.path.isfile(cred_path):
+            creds = Credentials.from_service_account_file(cred_path, scopes=scopes)
+        else:
+            info = _google_credentials_from_env()
+            if info is None:
+                raise FileNotFoundError(cred_path)
+            creds = Credentials.from_service_account_info(info, scopes=scopes)
         client = gspread.authorize(creds)
         logger.info("Successfully connected to Google Sheets.")
         return client
     except FileNotFoundError:
-        logger.error(f"Google Sheets credentials file not found: {GOOGLE_SHEETS_CREDS_FILE}")
+        logger.error("Google Sheets credentials file not found: %s", _google_credentials_path())
         return None
     except Exception as e:
         logger.error(f"Failed to connect to Google Sheets: {e}")
         return None
 
+_materialize_google_credentials_from_env()
 gspread_client = get_gspread_client()
 spreadsheet = gspread_client.open_by_key(GOOGLE_SHEET_ID) if gspread_client else None
 sheets_cache = {}
@@ -6443,7 +6465,6 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Error sending error message: {e}")
 
 def main() -> None:
-    _materialize_google_credentials_from_env()
     _validate_required_config()
 
     os.makedirs(os.path.join(SCRIPT_DIR, GIFS_DIR), exist_ok=True)
