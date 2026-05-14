@@ -493,6 +493,10 @@ def get_gspread_client():
         return _sheets_client
     now = time.time()
     if now - _sheets_last_connect_attempt < SHEETS_CONNECT_RETRY_SEC:
+        logger.warning(
+            "Google Sheets: повторное подключение отложено ещё на %.0f с (см. ошибку выше).",
+            SHEETS_CONNECT_RETRY_SEC - (now - _sheets_last_connect_attempt),
+        )
         return None
     _sheets_last_connect_attempt = now
     try:
@@ -528,7 +532,16 @@ def get_spreadsheet():
     if _spreadsheet is not None:
         return _spreadsheet
     client = get_gspread_client()
-    if not client or not GOOGLE_SHEET_ID:
+    if not client:
+        logger.error(
+            "Google Sheets: клиент gspread не создан (credentials / JWT / сеть). "
+            "Файл: %s существует=%s",
+            _google_credentials_path(),
+            os.path.isfile(_google_credentials_path()),
+        )
+        return None
+    if not GOOGLE_SHEET_ID:
+        logger.error("Google Sheets: GOOGLE_SHEET_ID пуст — таблица не откроется.")
         return None
     try:
         _spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
@@ -540,6 +553,14 @@ def get_spreadsheet():
 
 
 _materialize_google_credentials_from_env()
+
+_cred_diag_path = _google_credentials_path()
+logger.info(
+    "Google Sheets bootstrap: cred_path=%s exists=%s sheet_id_len=%s",
+    _cred_diag_path,
+    os.path.isfile(_cred_diag_path),
+    len(GOOGLE_SHEET_ID) if GOOGLE_SHEET_ID else 0,
+)
 
 
 async def get_worksheet_cached(sheet_name: str):
@@ -6605,10 +6626,12 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main() -> None:
     _validate_required_config()
-    if not get_gspread_client():
+    sheets_client = get_gspread_client()
+    if not sheets_client:
         logger.error(
             "Google Sheets недоступны: проверьте credentials.json / GOOGLE_CREDENTIALS_JSON "
-            "(при Invalid JWT Signature выпустите новый JSON-ключ сервисного аккаунта в Google Cloud)."
+            "(при Invalid JWT Signature выпустите новый JSON-ключ сервисного аккаунта в Google Cloud). "
+            "Если обновили файл локально — сделайте git commit и push, иначе Railway задеплоит старый образ."
         )
     elif not get_spreadsheet():
         logger.error(
