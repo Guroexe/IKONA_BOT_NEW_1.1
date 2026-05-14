@@ -480,7 +480,21 @@ BASE_RETRY_DELAY = 60
 # --- GOOGLE SHEETS & FILE SETUP ---
 # =================================================================================
 
+_sheets_client = None
+_spreadsheet = None
+_sheets_last_connect_attempt = 0.0
+SHEETS_CONNECT_RETRY_SEC = 12.0
+sheets_cache = {}
+
+
 def get_gspread_client():
+    global _sheets_client, _sheets_last_connect_attempt
+    if _sheets_client is not None:
+        return _sheets_client
+    now = time.time()
+    if now - _sheets_last_connect_attempt < SHEETS_CONNECT_RETRY_SEC:
+        return None
+    _sheets_last_connect_attempt = now
     try:
         scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
         info = _load_google_service_account_info()
@@ -488,9 +502,12 @@ def get_gspread_client():
         from google.auth.transport.requests import Request
 
         creds.refresh(Request())
-        client = gspread.authorize(creds)
-        logger.info("Successfully connected to Google Sheets.")
-        return client
+        _sheets_client = gspread.authorize(creds)
+        logger.info(
+            "Successfully connected to Google Sheets as %s",
+            info.get("client_email", "service_account"),
+        )
+        return _sheets_client
     except FileNotFoundError:
         logger.error("Google Sheets credentials file not found: %s", _google_credentials_path())
         return None
@@ -498,24 +515,32 @@ def get_gspread_client():
         logger.error("Failed to connect to Google Sheets: %s", e)
         return None
 
-_materialize_google_credentials_from_env()
-gspread_client = get_gspread_client()
-spreadsheet = None
-sheets_cache = {}
+
+def _reset_google_sheets_cache() -> None:
+    global _sheets_client, _spreadsheet
+    _sheets_client = None
+    _spreadsheet = None
+    sheets_cache.clear()
 
 
 def get_spreadsheet():
-    global spreadsheet
-    if spreadsheet is not None:
-        return spreadsheet
-    if not gspread_client or not GOOGLE_SHEET_ID:
+    global _spreadsheet
+    if _spreadsheet is not None:
+        return _spreadsheet
+    client = get_gspread_client()
+    if not client or not GOOGLE_SHEET_ID:
         return None
     try:
-        spreadsheet = gspread_client.open_by_key(GOOGLE_SHEET_ID)
-        return spreadsheet
+        _spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+        return _spreadsheet
     except Exception as e:
         logger.error("Failed to open Google spreadsheet %s: %s", GOOGLE_SHEET_ID, e)
+        _reset_google_sheets_cache()
         return None
+
+
+_materialize_google_credentials_from_env()
+
 
 async def get_worksheet_cached(sheet_name: str):
     sheet = get_spreadsheet()
@@ -533,20 +558,39 @@ async def get_worksheet_cached(sheet_name: str):
             sheets_cache[sheet_name] = (worksheet, now)
             return worksheet
         except WorksheetNotFound:
-            logger.warning(f"Worksheet {sheet_name} not found")
+            if re.fullmatch(r".+ \d{4}", sheet_name):
+                logger.info("Creating worksheet %s", sheet_name)
+                try:
+                    worksheet = await asyncio.to_thread(
+                        sheet.add_worksheet,
+                        title=sheet_name,
+                        rows=300,
+                        cols=10,
+                    )
+                    sheets_cache[sheet_name] = (worksheet, now)
+                    return worksheet
+                except Exception as e:
+                    logger.error("Failed to create worksheet %s: %s", sheet_name, e)
+            logger.warning("Worksheet %s not found", sheet_name)
             return None
         except APIError as e:
             if e.response.status_code == 429:
                 delay = BASE_RETRY_DELAY * (2 ** attempt)
-                logger.warning(f"Quota exceeded for worksheet {sheet_name}. Retrying in {delay} seconds... (Attempt {attempt + 1}/{MAX_RETRIES})")
+                logger.warning(
+                    "Quota exceeded for worksheet %s. Retrying in %s seconds... (Attempt %s/%s)",
+                    sheet_name,
+                    delay,
+                    attempt + 1,
+                    MAX_RETRIES,
+                )
                 await asyncio.sleep(delay)
             else:
-                logger.error(f"API error getting worksheet {sheet_name}: {e}")
+                logger.error("API error getting worksheet %s: %s", sheet_name, e)
                 return None
         except Exception as e:
-            logger.error(f"Error getting worksheet {sheet_name}: {e}")
+            logger.error("Error getting worksheet %s: %s", sheet_name, e)
             return None
-    logger.error(f"Failed to get worksheet {sheet_name} after {MAX_RETRIES} retries")
+    logger.error("Failed to get worksheet %s after %s retries", sheet_name, MAX_RETRIES)
     return None
 
 def get_files_in_dir(directory, image_exts=None):
@@ -6501,11 +6545,7 @@ async def background_scheduler():
 
 async def _warm_google_sheets_cache() -> None:
     try:
-        sheet = await asyncio.to_thread(get_spreadsheet)
-        if not sheet:
-            return
-        today = datetime.date.today()
-        await get_worksheet_cached(f"{RUSSIAN_MONTHS[today.month]} {today.year}")
+        await create_monthly_sheets_job()
     except Exception as e:
         logger.warning("sheet warm cache skipped: %s", e)
 
@@ -6565,6 +6605,15 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main() -> None:
     _validate_required_config()
+    if not get_gspread_client():
+        logger.error(
+            "Google Sheets недоступны: проверьте credentials.json / GOOGLE_CREDENTIALS_JSON "
+            "(при Invalid JWT Signature выпустите новый JSON-ключ сервисного аккаунта в Google Cloud)."
+        )
+    elif not get_spreadsheet():
+        logger.error(
+            "Google Spreadsheet не открывается: проверьте GOOGLE_SHEET_ID и доступ сервисного аккаунта к таблице."
+        )
 
     os.makedirs(os.path.join(SCRIPT_DIR, GIFS_DIR), exist_ok=True)
     for directory in [ANIME_DIR, TRIBAL_DIR, OTHER_DIR, MERCH_PHOTOS_DIR]:
