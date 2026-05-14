@@ -200,17 +200,26 @@ def _normalize_google_service_account_info(info: dict) -> dict:
 
 
 def _load_google_service_account_info() -> dict:
+    env_info = _google_credentials_from_env()
+    if env_info is not None:
+        return env_info
     cred_path = _google_credentials_path()
     if os.path.isfile(cred_path):
-        with open(cred_path, encoding="utf-8") as f:
+        with open(cred_path, encoding="utf-8-sig") as f:
             info = json.load(f)
         if isinstance(info, dict):
             return _normalize_google_service_account_info(info)
         raise ValueError(f"Google credentials file is not a JSON object: {cred_path}")
-    info = _google_credentials_from_env()
-    if info is None:
-        raise FileNotFoundError(cred_path)
-    return info
+    raise FileNotFoundError(cred_path)
+
+
+def _google_credentials_source_label() -> str:
+    if _google_credentials_from_env() is not None:
+        return "GOOGLE_CREDENTIALS_JSON"
+    cred_path = _google_credentials_path()
+    if os.path.isfile(cred_path):
+        return cred_path
+    return "missing"
 
 
 def _materialize_google_credentials_from_env() -> None:
@@ -516,7 +525,18 @@ def get_gspread_client():
         logger.error("Google Sheets credentials file not found: %s", _google_credentials_path())
         return None
     except Exception as e:
-        logger.error("Failed to connect to Google Sheets: %s", e)
+        try:
+            info = _load_google_service_account_info()
+            logger.error(
+                "Failed to connect to Google Sheets: %s (source=%s account=%s key_id=%s project=%s)",
+                e,
+                _google_credentials_source_label(),
+                info.get("client_email"),
+                info.get("private_key_id"),
+                info.get("project_id"),
+            )
+        except Exception:
+            logger.error("Failed to connect to Google Sheets: %s", e)
         return None
 
 
@@ -555,11 +575,21 @@ def get_spreadsheet():
 _materialize_google_credentials_from_env()
 
 _cred_diag_path = _google_credentials_path()
+try:
+    _cred_diag_info = _load_google_service_account_info()
+    _cred_diag_email = _cred_diag_info.get("client_email")
+    _cred_diag_key_id = _cred_diag_info.get("private_key_id")
+except Exception:
+    _cred_diag_email = None
+    _cred_diag_key_id = None
 logger.info(
-    "Google Sheets bootstrap: cred_path=%s exists=%s sheet_id_len=%s",
+    "Google Sheets bootstrap: source=%s cred_path=%s exists=%s sheet_id_len=%s account=%s key_id=%s",
+    _google_credentials_source_label(),
     _cred_diag_path,
     os.path.isfile(_cred_diag_path),
     len(GOOGLE_SHEET_ID) if GOOGLE_SHEET_ID else 0,
+    _cred_diag_email,
+    _cred_diag_key_id,
 )
 
 
