@@ -31,15 +31,36 @@ from telegram.constants import ParseMode, ChatAction
 from telegram.error import BadRequest, Conflict, NetworkError, TimedOut
 from telegram.request import HTTPXRequest
 
+def _parse_dotenv_file(path: str) -> None:
+    """Минимальный парсер `.env`, если python-dotenv не установлен в текущем Python."""
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                if not key or key in os.environ:
+                    continue
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                os.environ[key] = value
+    except OSError:
+        pass
+
+
 def _load_dotenv() -> None:
     """Подхватывает `.env` рядом с main.py (локально). На Railway переменные задаются в UI."""
+    root = os.path.dirname(os.path.abspath(__file__))
+    env_path = os.path.join(root, ".env")
     try:
         from dotenv import load_dotenv
 
-        root = os.path.dirname(os.path.abspath(__file__))
-        load_dotenv(os.path.join(root, ".env"))
+        load_dotenv(env_path)
     except ImportError:
-        pass
+        _parse_dotenv_file(env_path)
 
 
 _load_dotenv()
